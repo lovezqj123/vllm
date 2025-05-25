@@ -175,7 +175,7 @@ class Attention(nn.Module):
                 key = key.view(-1, self.num_kv_heads, self.head_size)
             if value is not None:
                 value = value.view(-1, self.num_kv_heads, self.head_size)
-            if self.use_direct_call:
+            if self.use_direct_call or True:
                 forward_context: ForwardContext = get_forward_context()
                 ctx_attn_metadata = forward_context.attn_metadata
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]

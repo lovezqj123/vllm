@@ -225,36 +225,53 @@ set(VLLM_EXT_SRC
   "csrc/torch_bindings.cpp")
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
-  SET(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")
-
-  # Set CUTLASS_REVISION manually -- its revision detection doesn't work in this case.
-  set(CUTLASS_REVISION "v3.6.0" CACHE STRING "CUTLASS revision to use")
-
-  # Use the specified CUTLASS source directory for compilation if VLLM_CUTLASS_SRC_DIR is provided
-  if (DEFINED ENV{VLLM_CUTLASS_SRC_DIR})
-    set(VLLM_CUTLASS_SRC_DIR $ENV{VLLM_CUTLASS_SRC_DIR})
+  set(LOCAL_CUTLASS_PATH "/home/msgaozq/gao/cutlass")
+  set(CUTLASS_DIR ${LOCAL_CUTLASS_PATH} CACHE PATH "Path to local CUTLASS")
+  set(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")
+  set(CUTLASS_INCLUDE_DIR "${LOCAL_CUTLASS_PATH}/include")
+  include_directories(${CUTLASS_INCLUDE_DIR})
+  if (NOT EXISTS ${CUTLASS_INCLUDE_DIR}/cutlass/cutlass.h)
+    message(FATAL_ERROR "Local CUTLASS not found at: ${LOCAL_CUTLASS_PATH}")
   endif()
+  # SET(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")
 
-  if(VLLM_CUTLASS_SRC_DIR)
-    if(NOT IS_ABSOLUTE VLLM_CUTLASS_SRC_DIR)
-      get_filename_component(VLLM_CUTLASS_SRC_DIR "${VLLM_CUTLASS_SRC_DIR}" ABSOLUTE)
-    endif()
-    message(STATUS "The VLLM_CUTLASS_SRC_DIR is set, using ${VLLM_CUTLASS_SRC_DIR} for compilation")
-    FetchContent_Declare(cutlass SOURCE_DIR ${VLLM_CUTLASS_SRC_DIR})
-  else()
-    FetchContent_Declare(
-        cutlass
-        GIT_REPOSITORY https://github.com/nvidia/cutlass.git
-        GIT_TAG v3.7.0
-        GIT_PROGRESS TRUE
+  # # Set CUTLASS_REVISION manually -- its revision detection doesn't work in this case.
+  # set(CUTLASS_REVISION "v3.6.0" CACHE STRING "CUTLASS revision to use")
 
-        # Speed up CUTLASS download by retrieving only the specified GIT_TAG instead of the history.
-        # Important: If GIT_SHALLOW is enabled then GIT_TAG works only with branch names and tags.
-        # So if the GIT_TAG above is updated to a commit hash, GIT_SHALLOW must be set to FALSE
-        GIT_SHALLOW TRUE
-    )
-  endif()
-  FetchContent_MakeAvailable(cutlass)
+  # # Use the specified CUTLASS source directory for compilation if VLLM_CUTLASS_SRC_DIR is provided
+  # if (DEFINED ENV{VLLM_CUTLASS_SRC_DIR})
+  #   set(VLLM_CUTLASS_SRC_DIR $ENV{VLLM_CUTLASS_SRC_DIR})
+  # endif()
+
+  # if(VLLM_CUTLASS_SRC_DIR)
+  #   if(NOT IS_ABSOLUTE VLLM_CUTLASS_SRC_DIR)
+  #     get_filename_component(VLLM_CUTLASS_SRC_DIR "${VLLM_CUTLASS_SRC_DIR}" ABSOLUTE)
+  #   endif()
+  #   message(STATUS "The VLLM_CUTLASS_SRC_DIR is set, using ${VLLM_CUTLASS_SRC_DIR} for compilation")
+  #   FetchContent_Declare(cutlass SOURCE_DIR ${VLLM_CUTLASS_SRC_DIR})
+  #   include_directories(${VLLM_CUTLASS_SRC_DIR}/include)
+  # else()
+  #   # FetchContent_Declare(
+  #   #     cutlass
+  #   #     GIT_REPOSITORY https://github.com/nvidia/cutlass.git
+  #   #     GIT_TAG v3.7.0
+  #   #     GIT_PROGRESS TRUE
+
+  #   #     # Speed up CUTLASS download by retrieving only the specified GIT_TAG instead of the history.
+  #   #     # Important: If GIT_SHALLOW is enabled then GIT_TAG works only with branch names and tags.
+  #   #     # So if the GIT_TAG above is updated to a commit hash, GIT_SHALLOW must be set to FALSE
+  #   #     GIT_SHALLOW TRUE
+  #   # )
+  #   set(LOCAL_CUTLASS_PATH "/home/msgaozq/gao/cutlass")
+  #   set(CUTLASS_DIR ${LOCAL_CUTLASS_PATH} CACHE PATH "Path to local CUTLASS")
+  #   set(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")
+  #   set(CUTLASS_INCLUDE_DIR "${LOCAL_CUTLASS_PATH}/include")
+  #   include_directories(${CUTLASS_INCLUDE_DIR})
+  #   if (NOT EXISTS ${CUTLASS_INCLUDE_DIR}/cutlass/cutlass.h)
+  #     message(FATAL_ERROR "Local CUTLASS not found at: ${LOCAL_CUTLASS_PATH}")
+  #   endif()
+  # endif()
+  # FetchContent_MakeAvailable(cutlass)
 
   list(APPEND VLLM_EXT_SRC
     "csrc/mamba/mamba_ssm/selective_scan_fwd.cu"
