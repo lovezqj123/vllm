@@ -42,3 +42,10 @@ class TargetModelRunner(ModelRunnerWrapperBase):
         model_input.sampling_metadata.skip_sampler_cpu_output = (
             self.disable_logprobs)
         return model_input
+
+class SimpleModelRunnerWrapper(ModelRunnerWrapperBase):
+    """Just to carry over compilation_config from vllm_config."""
+    def __init__(self, model_runner: ModelRunnerBase):
+        super().__init__(model_runner)
+        # ModelRunnerWrapperBase __init__ already did:
+        self.compilation_config = model_runner.vllm_config.compilation_config
