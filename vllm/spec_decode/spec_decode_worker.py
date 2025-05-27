@@ -53,6 +53,9 @@ def create_spec_worker(*args, **kwargs) -> "SpecDecodeWorker":
     """Helper method that is the entrypoint for Executors which use
     WorkerWrapper. It constructs a SpecDecodeWorker from the speculative config.
     """
+    import torch
+    torch.cuda.empty_cache()
+
     vllm_config: VllmConfig = kwargs.get("vllm_config")
     speculative_config: SpeculativeConfig = vllm_config.speculative_config
     assert speculative_config is not None
@@ -74,6 +77,21 @@ def create_spec_worker(*args, **kwargs) -> "SpecDecodeWorker":
     # as per its value specified in the SpeculativeConfig.
     target_worker.model_runner.disable_logprobs =\
          speculative_config.disable_logprobs
+ 
+    #TODO: 实现中间模型的创建  类似target——worker的创建即可
+    mid_kwargs = kwargs.copy()
+    mid_worker_config = copy.deepcopy(vllm_config)
+    mid_worker_config.model_config.model = '/home/msgaozq/.cache/modelscope/hub/models/easyllm/Meta-Llama-3.1-405B-Instruct-eval-result'
+    mid_worker_config.parallel_config.worker_cls =\
+        mid_worker_config.parallel_config.sd_worker_cls
+    mid_kwargs["vllm_config"] = mid_worker_config
+    mid_cls = resolve_obj_by_qualname(
+        mid_worker_config.parallel_config.worker_cls)
+    mid_worker = mid_cls(*args, **mid_kwargs)
+    # Set the disable_logprobs variable in the TargetModelRunner instance
+    mid_worker.model_runner.disable_logprobs =\
+            speculative_config.disable_logprobs
+     
 
     draft_worker_config = copy.deepcopy(vllm_config)
     draft_worker_config.model_config = speculative_config.draft_model_config
@@ -95,6 +113,7 @@ def create_spec_worker(*args, **kwargs) -> "SpecDecodeWorker":
 
     spec_decode_worker = SpecDecodeWorker.create_worker(
         scorer_worker=target_worker,
+        mid_worker=mid_worker,
         draft_worker_kwargs=draft_worker_kwargs,
         disable_mqa_scorer=speculative_config.speculative_disable_mqa_scorer,
         disable_by_batch_size=speculative_config.
@@ -144,6 +163,7 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
     def create_worker(
         cls,
         scorer_worker: WorkerBase,
+        mid_worker: WorkerBase,
         draft_worker_kwargs: Dict[str, Any],
         disable_mqa_scorer: bool,
         disable_by_batch_size: Optional[int],
@@ -233,6 +253,7 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
 
         return SpecDecodeWorker(
             proposer_worker,
+            mid_worker,
             scorer_worker,
             disable_mqa_scorer=disable_mqa_scorer,
             disable_logprobs=disable_logprobs,
@@ -244,6 +265,7 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
     def __init__(
         self,
         proposer_worker: ProposerWorkerBase,
+        mid_worker: WorkerBase,
         scorer_worker: WorkerBase,
         spec_decode_sampler: SpecDecodeBaseSampler,
         disable_mqa_scorer: bool = False,
@@ -284,6 +306,7 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
                 draft model is larger than 1 (TODO: #5814)
         """
         self.proposer_worker = proposer_worker
+        self.mid_worker = mid_worker
         self.scorer_worker = scorer_worker
         scorer_runner = getattr(self.scorer_worker, "model_runner", None)
         self.generators = scorer_runner.get_generators(
@@ -307,6 +330,7 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         self.token_id_dtype = self.spec_decode_sampler.token_id_dtype
         # Lazy initialization.
         self.scorer: SpeculativeScorer
+        self.mid_scorer: SpeculativeScorer
         self.disable_mqa_scorer = disable_mqa_scorer
 
         # Hidden states from target model to pass to proposer
@@ -321,10 +345,12 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         # The scorer worker model is initialized first in case the proposer
         # model has a smaller TP degree than the target worker.
         self.scorer_worker.init_device()
+        self.mid_worker.init_device()
         self.proposer_worker.init_device()
 
         # NOTE(cade): load_model is not part of the WorkerBase interface.
         self.scorer_worker.load_model()
+        self.mid_worker.load_model()
         self.proposer_worker.load_model()
 
         self._metrics.init_tensors(self.rank, device_type=self.device)
@@ -344,6 +370,9 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         self.scorer = scorer_cls(scorer_worker=self.scorer_worker,
                                  device=self.device,
                                  vocab_size=self._vocab_size)
+        self.mid_scorer = scorer_cls(mid_worker=self.mid_worker,
+                                     device=self.device,
+                                     vocab_size=self._vocab_size)
 
         self._configure_model_sampler_for_spec_decode()
 
@@ -369,10 +398,12 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         NOTE(cade): This will require a special check if the proposer worker
         does not have a sampler (e.g. ngram speculation).
         """
-        (self.scorer_worker.model_runner.model.sampler.include_gpu_probs_tensor
-         ) = True
-        (self.scorer_worker.model_runner.model.sampler.
-         should_modify_greedy_probs_inplace) = True
+        (self.scorer_worker.model_runner.model.sampler.include_gpu_probs_tensor) = True
+        (self.scorer_worker.model_runner.model.sampler.should_modify_greedy_probs_inplace) = True
+
+        (self.mid_worker.model_runner.model.sampler.include_gpu_probs_tensor) = True
+        (self.mid_worker.model_runner.model.sampler.should_modify_greedy_probs_inplace) = True
+
         self.proposer_worker.set_include_gpu_probs_tensor()
         self.proposer_worker.set_should_modify_greedy_probs_inplace()
 
@@ -386,14 +417,15 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         """
         num_gpu_blocks, num_cpu_blocks = (
             self.scorer_worker.determine_num_available_blocks())
-
         scorer_cache_block_size_bytes = (
             self.scorer_worker.get_cache_block_size_bytes())
+        mid_cache_block_size_bytes = (
+            self.mid_worker.get_cache_block_size_bytes())
         proposer_cache_block_size_bytes = (
             self.proposer_worker.get_cache_block_size_bytes())
 
         new_num_gpu_blocks = split_num_cache_blocks_evenly(
-            scorer_cache_block_size_bytes, proposer_cache_block_size_bytes,
+            scorer_cache_block_size_bytes, mid_cache_block_size_bytes,proposer_cache_block_size_bytes,
             num_gpu_blocks)
         return new_num_gpu_blocks, num_cpu_blocks
 
@@ -403,6 +435,8 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         """
         self.scorer_worker.initialize_cache(num_gpu_blocks=num_gpu_blocks,
                                             num_cpu_blocks=num_cpu_blocks)
+        self.mid_worker.initialize_cache(num_gpu_blocks=num_gpu_blocks,
+                                         num_cpu_blocks=num_cpu_blocks)
         self.proposer_worker.initialize_cache(num_gpu_blocks=num_gpu_blocks,
                                               num_cpu_blocks=num_cpu_blocks)
 
@@ -745,8 +779,56 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
             #TODO: Fix it #5814
             raise RuntimeError("Cannot handle cases where distributed draft "
                                "workers generate no tokens")
-
         execute_model_req.previous_hidden_states = None
+        
+        # 中间模型对draft_proposals进行评分
+        with Timer() as execute_model_timer:
+            mid_scores = self.mid_scorer.score_proposals(
+                execute_model_req,
+                proposals,
+            )
+        print(mid_scores)
+        import pdb; pdb.set_trace()
+
+        # 1. 草稿模型已有 proposals，先对它评分
+        # with Timer() as draft_scoring_timer:
+        #     draft_scores = self.draft_scorer.score_proposals(execute_model_req, proposals)
+
+        # # 2. 根据 draft_scores 找出“质量不高”的token区间（你需要实现这个函数）
+        # low_quality_segments = self._find_low_quality_segments(proposals, draft_scores)
+
+        # # 3. 用中间模型针对这些低质量token区间生成补充token
+        # # 这里假设 execute_model_req.clone(seqs) 是复制请求用于下游模型执行
+        # mid_generated_tokens = []
+        # for segment in low_quality_segments:
+        #     segment_req = execute_model_req.clone(segment.seqs)
+        #     # 由中间模型生成续写tokens（类似decode或采样接口）
+        #     mid_out = self.mid_model.generate_tokens(segment_req)
+        #     mid_generated_tokens.append(mid_out)
+
+        # # 4. 把中间模型生成的补充token拼接到原proposals里，得到 refined_proposals
+        # refined_proposals = self._merge_mid_generated_tokens(proposals, mid_generated_tokens, low_quality_segments)
+
+        # # 5. 目标模型对 refined_proposals 做最终评分和验证
+        # with Timer() as target_scoring_timer:
+        #     target_scores = self.target_scorer.score_proposals(execute_model_req, refined_proposals)
+
+        # # 6. 验证、挑选token（逻辑和你之前类似）
+        # accepted_token_ids, target_logprobs = self._verify_tokens(
+        #     execute_model_req.seq_group_metadata_list, target_scores,
+        #     refined_proposals, execute_model_req.num_lookahead_slots)
+
+        # # 7. 返回最终输出
+        # return self._create_output_sampler_list(
+        #     execute_model_req.seq_group_metadata_list,
+        #     accepted_token_ids,
+        #     target_logprobs=target_logprobs,
+        #     prompt_logprobs=target_scores.prompt_logprobs if not self._disable_logprobs else None,
+        #     k=execute_model_req.num_lookahead_slots,
+        #     stage_times=(draft_scoring_timer.elapsed_time_ms, target_scoring_timer.elapsed_time_ms)
+        # )
+
+
 
         with Timer() as scoring_timer:
             proposal_scores = self.scorer.score_proposals(
@@ -1248,6 +1330,7 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
 
 
 def split_num_cache_blocks_evenly(scorer_cache_block_size_bytes: int,
+                                  mid_cache_block_size_bytes: int,
                                   proposer_cache_block_size_bytes: int,
                                   total_num_gpu_blocks: int) -> int:
     """Given total_num_gpu_blocks, the number of GPU blocks that could be
@@ -1265,7 +1348,7 @@ def split_num_cache_blocks_evenly(scorer_cache_block_size_bytes: int,
     """
     new_num_gpu_blocks = int(
         total_num_gpu_blocks * scorer_cache_block_size_bytes /
-        (proposer_cache_block_size_bytes + scorer_cache_block_size_bytes))
+        (proposer_cache_block_size_bytes + scorer_cache_block_size_bytes + mid_cache_block_size_bytes))
 
     return new_num_gpu_blocks
 

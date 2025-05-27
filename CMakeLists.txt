@@ -584,6 +584,7 @@ endif()
 # This is to enable local development of vllm-flash-attn within vLLM.
 # It can be set as an environment variable or passed as a cmake argument.
 # The environment variable takes precedence.
+set(VLLM_FLASH_ATTN_SRC_DIR "/home/msgaozq/gao/vllm-0.7.2/flash-attention")
 if (DEFINED ENV{VLLM_FLASH_ATTN_SRC_DIR})
   set(VLLM_FLASH_ATTN_SRC_DIR $ENV{VLLM_FLASH_ATTN_SRC_DIR})
 endif()
