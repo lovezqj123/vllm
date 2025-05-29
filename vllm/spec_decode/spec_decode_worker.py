@@ -45,8 +45,7 @@ from vllm.spec_decode.util import (Timer, create_logprobs_output,
                                    split_batch_by_proposal_len)
 from vllm.utils import resolve_obj_by_qualname
 from vllm.worker.worker_base import LoraNotSupportedWorkerBase, WorkerBase
-
-import json,os
+from collections import deque
 
 logger = init_logger(__name__)
 
@@ -76,50 +75,6 @@ def create_spec_worker(*args, **kwargs) -> "SpecDecodeWorker":
     # as per its value specified in the SpeculativeConfig.
     target_worker.model_runner.disable_logprobs =\
          speculative_config.disable_logprobs
-    
-
-    mid_worker = None
-    #TODO: 实现中间模型的创建  类似target——worker的创建即可
-    from vllm.worker.model_runner_base import ModelRunnerBase
-    mid_kwargs = copy.deepcopy(kwargs)
-    mid_worker_config = copy.deepcopy(vllm_config)
-
-    model_dir_mid = "/home/msgaozq/.cache/modelscope/hub/models/LLM-Research/Llama-3.2-1B"
-    cfg_path_mid = os.path.join(model_dir_mid, "config.json")
-    with open(cfg_path_mid, "r") as f:
-        hf_cfg_mid = json.load(f)
-    for key in [
-        "hidden_size",
-        "intermediate_size",
-        "num_attention_heads",
-        "num_hidden_layers",
-        "vocab_size",
-        "max_position_embeddings",
-    ]:
-        if key in hf_cfg_mid:
-            value = hf_cfg_mid[key]
-            if hasattr(mid_worker_config.model_config.hf_text_config, key):
-                setattr(mid_worker_config.model_config.hf_text_config, key, value)
-            else:
-                print(f"Warning: {key} not found in model_config")
-
-    mid_worker_config.model_config.model = model_dir_mid
-    mid_worker_config.model_config.tokenizer = model_dir_mid
-    mid_worker_config.model_config.served_model_name = model_dir_mid
-    mid_worker_config.model_config.hf_text_config.head_dim = 64
-    mid_worker_config.model_config.hf_text_config.transformers_version = "4.45.0.dev0"
-
-    mid_worker_config.parallel_config.worker_cls = mid_worker_config.parallel_config.sd_worker_cls
-    mid_kwargs["vllm_config"] = mid_worker_config
-    mid_kwargs["model_runner_cls"] = TargetModelRunner
-    mid_cls = resolve_obj_by_qualname(mid_worker_config.parallel_config.worker_cls)
-
-    mid_worker = mid_cls(*args, **mid_kwargs)
-    # mid_worker = SimpleModelRunnerWrapper(mid_worker)
-    # Set the disable_logprobs variable in the TargetModelRunner instance
-    if hasattr(mid_worker.model_runner, "disable_logprobs"):
-        mid_worker.model_runner.disable_logprobs = speculative_config.disable_logprobs
-    #mid_worker = None
 
     draft_worker_config = copy.deepcopy(vllm_config)
     draft_worker_config.model_config = speculative_config.draft_model_config
@@ -141,7 +96,6 @@ def create_spec_worker(*args, **kwargs) -> "SpecDecodeWorker":
 
     spec_decode_worker = SpecDecodeWorker.create_worker(
         scorer_worker=target_worker,
-        mid_worker=mid_worker,
         draft_worker_kwargs=draft_worker_kwargs,
         disable_mqa_scorer=speculative_config.speculative_disable_mqa_scorer,
         disable_by_batch_size=speculative_config.
@@ -191,7 +145,6 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
     def create_worker(
         cls,
         scorer_worker: WorkerBase,
-        mid_worker: WorkerBase,
         draft_worker_kwargs: Dict[str, Any],
         disable_mqa_scorer: bool,
         disable_by_batch_size: Optional[int],
@@ -281,7 +234,6 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
 
         return SpecDecodeWorker(
             proposer_worker,
-            mid_worker,
             scorer_worker,
             disable_mqa_scorer=disable_mqa_scorer,
             disable_logprobs=disable_logprobs,
@@ -293,7 +245,6 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
     def __init__(
         self,
         proposer_worker: ProposerWorkerBase,
-        mid_worker: WorkerBase,
         scorer_worker: WorkerBase,
         spec_decode_sampler: SpecDecodeBaseSampler,
         disable_mqa_scorer: bool = False,
@@ -334,7 +285,6 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
                 draft model is larger than 1 (TODO: #5814)
         """
         self.proposer_worker = proposer_worker
-        self.mid_worker = mid_worker
         self.scorer_worker = scorer_worker
         scorer_runner = getattr(self.scorer_worker, "model_runner", None)
         self.generators = scorer_runner.get_generators(
@@ -366,6 +316,10 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         self._disable_logprobs = disable_logprobs
         self._disable_log_stats = disable_log_stats
 
+        self.sequence_states = {} # request_id > state dict
+        self.k_distribution = defaultdict(int) # 跟踪K值分布
+        self.dynaminc_flag = True
+
     def init_device(self) -> None:
         """Initialize both scorer and proposer models.
         """
@@ -373,14 +327,10 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         # model has a smaller TP degree than the target worker.
         self.scorer_worker.init_device()
         self.proposer_worker.init_device()
-        if(self.mid_worker is not None):
-            self.mid_worker.init_device()
 
         # NOTE(cade): load_model is not part of the WorkerBase interface.
         self.scorer_worker.load_model()
         self.proposer_worker.load_model()
-        if(self.mid_worker is not None):
-            self.mid_worker.load_model()
 
         self._metrics.init_tensors(self.rank, device_type=self.device)
         self.spec_decode_sampler.init_tensors(self.rank,
@@ -399,11 +349,6 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         self.scorer = scorer_cls(scorer_worker=self.scorer_worker,
                                  device=self.device,
                                  vocab_size=self._vocab_size)
-        
-        if(self.mid_worker is not None):
-            self.mid_scorer = scorer_cls(scorer_worker=self.mid_worker,
-                                        device=self.device,
-                                        vocab_size=self._vocab_size)
 
         self._configure_model_sampler_for_spec_decode()
 
@@ -433,11 +378,6 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
          ) = True
         (self.scorer_worker.model_runner.model.sampler.
          should_modify_greedy_probs_inplace) = True
-        
-        if(self.mid_worker is not None):
-            (self.mid_worker.model_runner.model.sampler.include_gpu_probs_tensor) = True
-            (self.mid_worker.model_runner.model.sampler.should_modify_greedy_probs_inplace) = True
-        
         self.proposer_worker.set_include_gpu_probs_tensor()
         self.proposer_worker.set_should_modify_greedy_probs_inplace()
 
@@ -456,15 +396,9 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
             self.scorer_worker.get_cache_block_size_bytes())
         proposer_cache_block_size_bytes = (
             self.proposer_worker.get_cache_block_size_bytes())
-        
-        if(self.mid_worker is not None):
-            mid_cache_block_size_bytes = (
-                self.mid_worker.get_cache_block_size_bytes())
-        else:
-            mid_cache_block_size_bytes = 0
 
         new_num_gpu_blocks = split_num_cache_blocks_evenly(
-            scorer_cache_block_size_bytes,  mid_cache_block_size_bytes, proposer_cache_block_size_bytes,
+            scorer_cache_block_size_bytes, proposer_cache_block_size_bytes,
             num_gpu_blocks)
         return new_num_gpu_blocks, num_cpu_blocks
 
@@ -474,15 +408,30 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         """
         self.scorer_worker.initialize_cache(num_gpu_blocks=num_gpu_blocks,
                                             num_cpu_blocks=num_cpu_blocks)
-        if(self.mid_worker is not None):
-            self.mid_worker.initialize_cache(num_gpu_blocks=num_gpu_blocks,
-                                            num_cpu_blocks=num_cpu_blocks)
-            
         self.proposer_worker.initialize_cache(num_gpu_blocks=num_gpu_blocks,
                                               num_cpu_blocks=num_cpu_blocks)
 
     def get_model(self) -> nn.Module:
         return self.scorer_worker.get_model()
+
+    def _calculate_dynamic_k(self, seq_meta:SequenceGroupMetadata) -> int:
+        request_id = seq_meta.request_id
+        state = self.sequence_states.get(request_id, {"position": 0, "accept_history": deque(maxlen = 10)})
+
+        # 计算平均接受率
+        avg_accept = (sum(state["accept_history"]) / len(state["accept_history"]) if state["accept_history"] else 0.8)
+
+        # 动态决策规则
+        if state["position"] < 8:  # 初始阶段
+            return 2
+        elif state["position"] > 60:  # 长序列
+            return 2
+        elif avg_accept > 0.78:  # 高接受率
+            return 4
+        elif avg_accept < 0.45:  # 低接受率
+            return 2
+        else:  # 中等接受率
+            return 2
 
     @torch.inference_mode()
     def execute_model(
@@ -532,12 +481,8 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         # In any of these cases, the proposer and scorer workers
         # are called normally.
         # We expect `num_speculative_tokens` to be None for prefills.
-        # 由调度器（scheduler）根据当前batch中可投机生成的token数量设置。作用：表示本轮可以“预推理”多少个token。如果为0，说明本轮没有可投机的token，直接用目标模型推理。
-        # disable_all_speculation 由系统负载、队列长度等策略动态决定。例如，当请求队列过长或批次过大时，为了保证整体吞吐量，会自动禁用投机解码。
-        # all_zero_spec_tokens  遍历本batch所有序列的元数据（如seq_group_metadata_list），判断每个序列的num_speculative_tokens是否都为0。  TODO：在这处理
         no_spec = (num_lookahead_slots == 0 or disable_all_speculation
                    or all_zero_spec_tokens)
-
         # Broadcast how many lookahead slots are scheduled for this step, and
         # whether all speculation is disabled, to all non-driver workers.
 
@@ -574,7 +519,8 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
             disable_all_speculation, execute_model_req.seq_group_metadata_list)
 
         if no_spec:
-            return self._run_no_spec(execute_model_req,skip_proposer=disable_all_speculation)
+            return self._run_no_spec(execute_model_req,
+                                     skip_proposer=disable_all_speculation)
         return self._run_speculative_decoding_step(execute_model_req,
                                                    num_lookahead_slots)
 
@@ -809,6 +755,18 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         # so that backend gets prefill|decode.
         assert num_lookahead_slots == execute_model_req.num_lookahead_slots
 
+        if(self.dynaminc_flag):
+            dynamic_k_value = []
+            for sgm in execute_model_req.seq_group_metadata_list:
+                if not sgm.do_sample or sgm.is_prompt:
+                    dynamic_k_value.append(0)
+                    continue
+                dynamic_k_value.append(self._calculate_dynamic_k(sgm))
+            
+            batch_k = min([k for k in dynamic_k_value if k > 0], default=3)
+            execute_model_req.num_lookahead_slots = batch_k
+            self.k_distribution[batch_k] += 1
+
         # Pass last hidden states from target model to proposer
         execute_model_req.previous_hidden_states = self.previous_hidden_states
         self.previous_hidden_states = None
@@ -824,98 +782,10 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
                                "workers generate no tokens")
         execute_model_req.previous_hidden_states = None
 
-        if(self.mid_worker is not None):
-            mid_scores = self.mid_scorer.score_proposals(
-                execute_model_req,
-                proposals,
-            )
-
-            proposals_token_ids = proposals.proposal_token_ids
-            mid_token_logprobs = mid_scores.probs
-
-            if hasattr(proposals_token_ids, 'tolist'):
-                proposals_token_ids = proposals_token_ids.tolist()
-            if hasattr(mid_token_logprobs, 'tolist'):
-                mid_token_logprobs = mid_token_logprobs.tolist()
-
-            refill_positions = []
-            batch_contexts = []
-            new_token_ids = []
-
-            for seq_idx, (tokens, logprobs) in enumerate(zip(proposals_token_ids, mid_token_logprobs)):
-                seq = []
-                for pos, (t, lp) in enumerate(zip(tokens, logprobs)):
-                    score = lp[0] if isinstance(lp, (list, tuple)) else lp
-                    if score < -2.0:
-                        refill_positions.append((seq_idx, pos))
-                        batch_contexts.append(seq.copy())
-                        seq.append(None)
-                    else:
-                        seq.append(t)
-                new_token_ids.append(seq)
-
-            if batch_contexts:
-                # 新组装的 SequenceGroupMetadata 列表
-                new_seq_group_metadata_list = []
-                for (seq_idx, _), context in zip(refill_positions, batch_contexts):
-                    # 深拷贝原有 SequenceGroupMetadata
-                    sgm = copy.deepcopy(execute_model_req.seq_group_metadata_list[seq_idx])
-                    # 获取唯一 seq_id
-                    seq_id = sgm.get_first_seq_id()
-                    # 深拷贝 SequenceData（确保不会影响原对象）
-                    seq_data = copy.deepcopy(sgm.seq_data[seq_id])
-
-                    # 将 context 转为 array 类型，保证类型匹配
-                    # VLLM_TOKEN_ID_ARRAY_TYPE 必须与你系统一致，否则用 np.int32
-                    if isinstance(context, np.ndarray):
-                        prompt_arr = context
-                    else:
-                        prompt_arr = np.array(context, dtype=seq_data._prompt_token_ids.dtype if hasattr(seq_data._prompt_token_ids, "dtype") else np.int32)
-
-                    seq_data._prompt_token_ids = prompt_arr
-                    seq_data._prompt_token_ids_tuple = tuple(context)
-                    seq_data._num_computed_tokens = len(context)
-                    # 可选：重置其它状态字段
-                    seq_data._output_token_ids = type(seq_data._output_token_ids)([])
-                    seq_data._cumulative_logprob = 0.0
-                    seq_data._stage = seq_data._stage.PREFILL
-                    seq_data._cached_all_token_ids = []
-                    seq_data._new_appended_tokens = []
-
-                    # 放回
-                    sgm.seq_data[seq_id] = seq_data
-                    # 确保 prompt 阶段
-                    sgm.is_prompt = True
-                    # 可选：重置 token_chunk_size
-                    sgm.token_chunk_size = len(context)
-                    new_seq_group_metadata_list.append(sgm)
-
-                # 构造新的 ExecuteModelRequest
-                refill_execute_model_req = execute_model_req.clone(
-                    seq_group_metadata_list=new_seq_group_metadata_list
-                )
-
-                # 批量推理
-                sampler_output = self.mid_worker.execute_model(refill_execute_model_req)
-                refill_tokens = sampler_output.token_ids
-                if hasattr(refill_tokens, "squeeze"):
-                    refill_tokens = refill_tokens.squeeze(-1).tolist()
-                else:
-                    refill_tokens = [int(t[0]) if isinstance(t, (list, tuple)) else int(t) for t in refill_tokens]
-
-                for (seq_idx, pos), new_token in zip(refill_positions, refill_tokens):
-                    new_token_ids[seq_idx][pos] = new_token
-
-            # 构造新的 proposals 对象
-            mid_fixed_proposals = copy.copy(proposals)
-            mid_fixed_proposals.proposal_token_ids = torch.tensor(
-                new_token_ids, device=proposals.proposal_token_ids.device
-            )
-
         with Timer() as scoring_timer:
             proposal_scores = self.scorer.score_proposals(
                 execute_model_req,
-                mid_fixed_proposals,
+                proposals,
             )
 
         _, (non_spec_seqs, non_spec_indices) = split_batch_by_proposal_len(
@@ -940,7 +810,7 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         with Timer() as verification_timer:
             accepted_token_ids, target_logprobs = self._verify_tokens(
                 execute_model_req.seq_group_metadata_list, proposal_scores,
-                mid_fixed_proposals, execute_model_req.num_lookahead_slots)
+                proposals, execute_model_req.num_lookahead_slots)
 
         stage_times = (proposal_timer.elapsed_time_ms / num_lookahead_slots,
                        scoring_timer.elapsed_time_ms,
@@ -1050,6 +920,25 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
             self.previous_hidden_states = HiddenStates(
                 hidden_states, terminal_metadata,
                 second_last_token_hidden_states)
+            
+        if(self.dynaminc_flag):
+            for i, sgm in enumerate(seq_group_metadata_list):
+                if i in spec_indices and proposal_lens_list[i] > 0:
+                    # 确保状态存在
+                    request_id = sgm.request_id
+                    if request_id not in self.sequence_states:
+                        self.sequence_states[request_id] = {"position": 0, "accept_history": deque(maxlen = 10)}
+                    
+                    # 计算接受概率
+                    seq_accepted = accepted_token_ids[i]
+                    num_accepted = (seq_accepted != -1).sum().item()
+                    accept_rate = num_accepted / proposal_lens_list[i]
+
+                    # updata state
+                    state = self.sequence_states[request_id]
+                    state["accept_history"].append(accept_rate)
+                    state["position"] += num_accepted
+
         return accepted_token_ids, logprobs
 
     def _create_output_sampler_list(
@@ -1347,6 +1236,9 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         internal book keeping data structures.
         """
         for finished_request in execute_model_req.finished_requests_ids:
+            #清理状态
+            if (self.dynaminc_flag and (finished_request in self.sequence_states)):
+                del self.sequence_states[finished_request]
             for seq_id in self._request_id_seq_id_mapping[finished_request]:
                 self._seq_with_bonus_token_in_last_step.discard(seq_id)
             del self._request_id_seq_id_mapping[finished_request]
@@ -1412,7 +1304,6 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
 
 
 def split_num_cache_blocks_evenly(scorer_cache_block_size_bytes: int,
-                                  mid_cache_block_size_bytes: int,
                                   proposer_cache_block_size_bytes: int,
                                   total_num_gpu_blocks: int) -> int:
     """Given total_num_gpu_blocks, the number of GPU blocks that could be
@@ -1430,7 +1321,7 @@ def split_num_cache_blocks_evenly(scorer_cache_block_size_bytes: int,
     """
     new_num_gpu_blocks = int(
         total_num_gpu_blocks * scorer_cache_block_size_bytes /
-        (proposer_cache_block_size_bytes + scorer_cache_block_size_bytes + mid_cache_block_size_bytes))
+        (proposer_cache_block_size_bytes + scorer_cache_block_size_bytes))
 
     return new_num_gpu_blocks
 
